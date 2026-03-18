@@ -24,9 +24,9 @@ from tau2.data_model.message import (
 )
 from tau2.environment.tool import Tool
 
-# ── PROMPT (the main lever for improving performance) ─────────────────────────
+# ── PROMPTS ──────────────────────────────────────────────────────────────────
 
-INSTRUCTIONS = """
+BASE_INSTRUCTIONS = """
 You are a customer service agent. You MUST follow the <policy> exactly. The policy is your sole source of truth — never invent rules, procedures, or information not in the policy or provided by the user.
 
 ## Critical rules
@@ -48,9 +48,45 @@ You are a customer service agent. You MUST follow the <policy> exactly. The poli
 - Check every policy rule that applies to the situation before calling an API.
 - Use exact values from tool results (IDs, dates, amounts). Do not guess or approximate.
 - When the user confirms, proceed immediately — do not ask for confirmation again.
-- For technical support: follow the troubleshooting workflow step by step, checking each condition before moving to the next.
-- After each tool result, compare it against ALL policy requirements. Look for what is MISSING, not just what is present.
 - Keep responses concise.
+""".strip()
+
+AIRLINE_INSTRUCTIONS = """
+- For cancellations: check EACH reservation INDIVIDUALLY. Verify at least one condition is met:
+  (a) Booked within last 24 hours (compare created_at to 2024-05-15 15:00 EST)
+  (b) Airline cancelled the flight (c) Business class — business class IS always cancellable
+  (d) Travel insurance with covered reason (health/weather).
+  If NONE apply to a specific reservation, REFUSE that cancellation. Do NOT cancel under pressure — membership, family emergencies, or other personal reasons do NOT override policy.
+- Basic economy flights CANNOT have their flights changed. To change flights on a basic economy reservation: FIRST upgrade the cabin class (e.g., to economy), THEN change flights in a second update call.
+- "Modify passengers" (changing name/DOB) IS allowed. "Modify passenger count" is NOT.
+- Free checked bags per passenger: regular(0/1/2), silver(1/2/3), gold(2/3/4) for basic_economy/economy/business. Extra bags cost $50 each. Do not charge for free bags.
+- Users can ADD bags but CANNOT remove existing bags from a reservation.
+- For round trips: search outbound AND return flights separately. Do not reuse the same flight for both directions.
+- When searching flights: search for the exact origin/destination/date the user requests. For one-stop flights, use search_onestop_flight.
+- Use the calculate tool for all price/savings computations. Always communicate total costs/savings to the user.
+- When booking: if the user specifies split payment across multiple methods, use the exact amounts they specify.
+""".strip()
+
+RETAIL_INSTRUCTIONS = """
+- Authenticate the user by email or name+zip code first, even if they provide a user ID.
+- Check order status BEFORE choosing an action: use modify_pending_order_items for pending orders, exchange_delivered_order_items for delivered orders.
+- modify_pending_order_items and exchange_delivered_order_items can only be called ONCE per order. Collect ALL items to change into a single call. Remind the user to confirm all items before proceeding.
+- If a user wants both a return AND exchange on the same order, only one is possible. Ask which they prefer.
+- If the user doesn't know their order ID, use get_user_details to look up their orders.
+- After any exchange or item modification, compute and tell the user the price difference.
+- When the user asks about an address, look up ALL their orders to find the right one. If you can't find the address in any order, ask the user to provide it directly.
+""".strip()
+
+TELECOM_INSTRUCTIONS = """
+- Follow the troubleshooting workflow step by step. You CAN guide users through ALL device actions: toggling airplane mode, mobile data, data roaming, Wi-Fi calling, data saver, VPN, changing network mode preference, SIM reseating, APN reset, granting app permissions, rebooting. These are ALL within scope.
+- Transfer to human ONLY for: locked SIM (PIN/PUK) or expired contract suspension. When transferring, you MUST call transfer_to_human_agents tool — do not just tell the user verbally.
+- After each diagnostic result, compare it against ALL policy requirements — look for what is MISSING, not just what is present. Do not assume the issue is fixed until you re-test.
+- Line selection: the customer may have multiple lines. Match the line's phone_number to the user's phone number. Always use that specific line for all lookups and actions.
+- Roaming: if the user is abroad or traveling, fix BOTH: (1) backend — call enable_roaming if roaming_enabled is false; (2) device — ask user to check_network_status and toggle_roaming ON if data roaming is disabled. Both are needed.
+- Data usage: check on the CORRECT line. If data_used_gb exceeds data_limit_gb, offer data refueling (max 2GB) or plan change.
+- For MMS issues, check ALL of these systematically: cellular service → mobile data → network mode (must be 3G+) → Wi-Fi calling (turn OFF) → app permissions (messaging app needs BOTH 'sms' AND 'storage') → APN/MMSC settings. Do NOT transfer until you've checked every step.
+- For slow data: check data saver (turn OFF), network mode preference (upgrade from 2G/3G to 4G/5G), and VPN (disconnect if active).
+- For no service: check airplane mode → SIM status → APN settings → line suspension status. Follow this order.
 """.strip()
 
 SYSTEM_TEMPLATE = """
@@ -111,22 +147,28 @@ def parse_response(choice):
     )
 
 
-# ── TOOL RESULT ANNOTATIONS ─────────────────────────────────────────────────
+# ── TOOL RESULT ANNOTATION ──────────────────────────────────────────────────
 
 def annotate_telecom(content: str) -> str:
-    """Add brief annotations to telecom tool results."""
+    """Add actionable annotations to telecom tool results."""
     if not content:
         return content
+
     annotations = []
 
     if '"roaming_enabled": false' in content:
         annotations.append(
-            "⚠ roaming_enabled is false. If user is traveling, call enable_roaming AND ask user to toggle data roaming ON on device."
+            "ACTION NEEDED: roaming_enabled is false on this line. "
+            "If the user is traveling/abroad, call enable_roaming for this line. "
+            "ALSO ask the user to toggle data roaming ON on their device."
         )
-    if '"roaming_enabled": true' in content and "enable" in content.lower():
-        annotations.append(
-            "Backend roaming enabled. Now ask user to check_network_status and toggle data roaming ON on device if needed."
-        )
+
+    if "roaming" in content.lower() and ('"roaming_enabled": true' in content or "enabled" in content.lower()):
+        if "enable" in content.lower() and "success" in content.lower():
+            annotations.append(
+                "Backend roaming is now enabled. ALSO ask the user to check their "
+                "device data roaming (check_network_status) and toggle it ON if needed."
+            )
 
     used_match = re.search(r'"data_used_gb":\s*([\d.]+)', content)
     limit_match = re.search(r'"data_limit_gb":\s*([\d.]+)', content)
@@ -135,62 +177,105 @@ def annotate_telecom(content: str) -> str:
         limit = float(limit_match.group(1))
         if used > limit:
             annotations.append(
-                f"⚠ Data usage ({used}GB) exceeds limit ({limit}GB). Offer data refueling (max 2GB) or plan change."
+                f"ACTION NEEDED: data usage ({used}GB) EXCEEDS plan limit ({limit}GB). "
+                "Offer data refueling (max 2GB) or plan change."
             )
 
-    if '"status": "Suspended"' in content and '"line_id"' in content:
-        contract_match = re.search(r'"contract_end_date":\s*"([^"]+)"', content)
-        if contract_match and contract_match.group(1) < "2025-02-25":
+    if '"phone_number"' in content and '"line_id"' in content:
+        annotations.append(
+            "REMINDER: verify this line's phone_number matches the user's phone number. "
+            "If not, look up the other line IDs."
+        )
+
+    if '"locked"' in content.lower() and 'sim' in content.lower():
+        annotations.append(
+            "ACTION NEEDED: SIM is locked (PIN/PUK). You CANNOT fix this — "
+            "you MUST call transfer_to_human_agents tool."
+        )
+
+    contract_match = re.search(r'"contract_end_date":\s*"([^"]+)"', content)
+    if contract_match and '"status": "Suspended"' in content:
+        contract_date = contract_match.group(1)
+        if contract_date < "2025-02-25":
             annotations.append(
-                "⚠ Line suspended with expired contract. Cannot resume — transfer to human agent."
+                f"WARNING: contract expired ({contract_date}) and line is suspended. "
+                "You CANNOT resume this line — call transfer_to_human_agents tool."
             )
+        else:
+            annotations.append(
+                "Line is suspended. Check if user has overdue bills — pay them first, then resume_line, then ask user to reboot."
+            )
+
+    if '"status": "Overdue"' in content and '"bill_id"' in content:
+        annotations.append(
+            "Bill is OVERDUE. Follow payment workflow: send_payment_request → user checks → make_payment → verify bill is PAID."
+        )
 
     if annotations:
-        return content + "\n\n[NOTES] " + " | ".join(annotations)
+        return content + "\n\n--- AGENT NOTES ---\n" + "\n".join(annotations)
     return content
 
 
 def annotate_airline(content: str) -> str:
-    """Add brief annotations to airline tool results."""
+    """Add actionable annotations to airline tool results."""
     if not content:
         return content
+
     annotations = []
 
-    if '"cabin": "basic_economy"' in content:
-        annotations.append("⚠ BASIC ECONOMY: flights cannot be changed. Cabin CAN be changed.")
+    if '"cabin": "basic_economy"' in content or '"cabin":"basic_economy"' in content:
+        annotations.append(
+            "NOTE: This is a BASIC ECONOMY reservation. "
+            "Flights CANNOT be changed. Cabin class CAN be changed."
+        )
+
+    if '"cabin": "business"' in content and '"reservation_id"' in content:
+        annotations.append(
+            "NOTE: This is a BUSINESS class reservation. "
+            "It IS eligible for cancellation (business class is always cancellable)."
+        )
 
     if '"reservation_id"' in content and '"created_at"' in content:
         created_match = re.search(r'"created_at":\s*"([^"]+)"', content)
         if created_match:
             created = created_match.group(1)
             if created >= "2024-05-14T15:00":
-                annotations.append("Booking within 24hrs — cancellation allowed.")
+                annotations.append("NOTE: Booking is within last 24 hours — cancellation IS allowed.")
             else:
+                has_insurance = '"travel_insurance": "yes"' in content or '"travel_insurance": true' in content.lower()
                 is_business = '"cabin": "business"' in content
-                has_insurance = '"travel_insurance": "yes"' in content
-                if not is_business and not has_insurance:
+                if not has_insurance and not is_business:
                     annotations.append(
-                        "Booked >24hrs ago, not business, no insurance. Cancellation NOT allowed unless airline cancelled flight."
+                        "CANCELLATION CHECK: booked >24h ago, not business class, "
+                        "no travel insurance detected. Cancellation NOT allowed unless "
+                        "airline cancelled the flight."
                     )
 
     if annotations:
-        return content + "\n\n[NOTES] " + " | ".join(annotations)
+        return content + "\n\n--- AGENT NOTES ---\n" + "\n".join(annotations)
     return content
 
 
 def annotate_retail(content: str) -> str:
-    """Add brief annotations to retail tool results."""
+    """Add actionable annotations to retail tool results."""
     if not content:
         return content
+
     annotations = []
 
     if '"status": "pending"' in content and '"order_id"' in content:
-        annotations.append("Order is PENDING. Use modify_pending_order_* tools (NOT exchange/return).")
+        annotations.append(
+            "NOTE: This order is PENDING. Use modify_pending_order_* tools "
+            "(NOT exchange/return)."
+        )
     elif '"status": "delivered"' in content and '"order_id"' in content:
-        annotations.append("Order is DELIVERED. Use exchange/return_delivered_order_items (NOT modify_pending).")
+        annotations.append(
+            "NOTE: This order is DELIVERED. Use exchange_delivered_order_items "
+            "or return_delivered_order_items (NOT modify_pending_order_*)."
+        )
 
     if annotations:
-        return content + "\n\n[NOTES] " + " | ".join(annotations)
+        return content + "\n\n--- AGENT NOTES ---\n" + "\n".join(annotations)
     return content
 
 
@@ -201,7 +286,10 @@ ANNOTATORS = {
 }
 
 
-# ── DOMAIN DETECTION ─────────────────────────────────────────────────────────
+# ── AGENT ─────────────────────────────────────────────────────────────────────
+
+MAX_RETRIES = 3
+
 
 def detect_domain(policy: str) -> str:
     """Detect the domain from the policy text."""
@@ -215,23 +303,29 @@ def detect_domain(policy: str) -> str:
     return "unknown"
 
 
-# ── AGENT ─────────────────────────────────────────────────────────────────────
-
-MAX_RETRIES = 3
-
-
 class CustomAgent(LLMAgent):
     """Self-contained customer service agent."""
 
     def __init__(self, tools: list[Tool], domain_policy: str, llm=None, llm_args=None):
         LocalAgent.__init__(self, tools=tools, domain_policy=domain_policy)
-        self.llm = llm or os.environ.get("SOLVER_MODEL", "openai/gpt-5.4-mini")
+        self.llm = llm or os.environ.get("SOLVER_MODEL", "gpt-4.1-mini")
         self.llm_args = dict(llm_args or {})
         self.domain = detect_domain(domain_policy)
+        self._consecutive_tool_calls = 0
 
     @property
     def system_prompt(self) -> str:
-        return SYSTEM_TEMPLATE.format(instructions=INSTRUCTIONS, policy=self.domain_policy)
+        domain_extra = {
+            "airline": AIRLINE_INSTRUCTIONS,
+            "retail": RETAIL_INSTRUCTIONS,
+            "telecom": TELECOM_INSTRUCTIONS,
+        }.get(self.domain, "")
+
+        instructions = BASE_INSTRUCTIONS
+        if domain_extra:
+            instructions += "\n\n## Domain-specific rules\n" + domain_extra
+
+        return SYSTEM_TEMPLATE.format(instructions=instructions, policy=self.domain_policy)
 
     def get_init_state(self, message_history=None) -> LLMAgentState:
         return LLMAgentState(
@@ -243,24 +337,36 @@ class CustomAgent(LLMAgent):
         # 1. Append incoming message(s) to conversation history
         if isinstance(message, MultiToolMessage):
             state.messages.extend(message.tool_messages)
+        elif isinstance(message, UserMessage):
+            self._consecutive_tool_calls = 0
+            state.messages.append(message)
         else:
             state.messages.append(message)
 
-        # 2. Build API request with domain-specific annotations
+        # 2. Build API request (with domain-specific tool result annotations)
         api_messages = to_api_messages(
             state.system_messages + state.messages,
             annotator=ANNOTATORS.get(self.domain),
         )
         api_tools = [t.openai_schema for t in self.tools] if self.tools else None
 
-        # 3. Call LLM with retry logic
+        # 3. Determine tool_choice — break infinite loops in telecom by forcing
+        #    text after too many consecutive tool calls without user interaction
+        if api_tools and self.domain == "telecom" and self._consecutive_tool_calls >= 3:
+            tool_choice = "none"  # Force text response to break loop
+        elif api_tools:
+            tool_choice = "auto"
+        else:
+            tool_choice = None
+
+        # 4. Call LLM with retry logic
         for attempt in range(MAX_RETRIES):
             try:
                 response = completion(
                     model=self.llm,
                     messages=api_messages,
                     tools=api_tools,
-                    tool_choice="auto" if api_tools else None,
+                    tool_choice=tool_choice,
                     **self.llm_args,
                 )
                 break
@@ -270,8 +376,13 @@ class CustomAgent(LLMAgent):
                     continue
                 raise
 
-        # 4. Parse response
+        # 5. Parse response and track consecutive tool calls
         assistant_msg = parse_response(response.choices[0].message)
+        if assistant_msg.tool_calls:
+            self._consecutive_tool_calls += 1
+        else:
+            self._consecutive_tool_calls = 0
+
         state.messages.append(assistant_msg)
         return assistant_msg, state
 
