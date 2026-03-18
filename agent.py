@@ -211,6 +211,20 @@ def annotate_telecom(content: str) -> str:
             "Bill is OVERDUE. Follow payment workflow: send_payment_request → user checks → make_payment → verify bill is PAID."
         )
 
+    # MMS troubleshooting reminders
+    if "can_send_mms" in content.lower() and ("false" in content.lower() or "cannot" in content.lower()):
+        annotations.append(
+            "MMS still not working. Continue checklist: network mode (3G+), "
+            "Wi-Fi calling (OFF), app permissions (sms AND storage), APN/MMSC. "
+            "Do NOT transfer until ALL checked."
+        )
+
+    # Speed test no connection
+    if "no connection" in content.lower() or "no_connection" in content.lower():
+        annotations.append(
+            "No data connection. Check: airplane mode, SIM, mobile data, roaming (if traveling), data usage."
+        )
+
     if annotations:
         return content + "\n\n--- AGENT NOTES ---\n" + "\n".join(annotations)
     return content
