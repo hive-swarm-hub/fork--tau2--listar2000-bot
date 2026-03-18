@@ -322,9 +322,13 @@ class CustomAgent(LLMAgent):
 
     def __init__(self, tools: list[Tool], domain_policy: str, llm=None, llm_args=None):
         LocalAgent.__init__(self, tools=tools, domain_policy=domain_policy)
-        self.llm = llm or os.environ.get("SOLVER_MODEL", "gpt-4.1-mini")
-        self.llm_args = dict(llm_args or {})
         self.domain = detect_domain(domain_policy)
+        # Use gpt-4.1 for airline/retail (more capable), gpt-4.1-mini for telecom (long workflows)
+        if self.domain == "telecom":
+            self.llm = "openai/gpt-4.1-mini"
+        else:
+            self.llm = "openai/gpt-4.1"
+        self.llm_args = dict(llm_args or {})
         self._consecutive_tool_calls = 0
 
     @property
@@ -373,20 +377,24 @@ class CustomAgent(LLMAgent):
         else:
             tool_choice = None
 
-        # 4. Call LLM with retry logic
-        for attempt in range(MAX_RETRIES):
+        # 4. Call LLM with retry logic (extra patience for rate limits)
+        for attempt in range(MAX_RETRIES + 2):
             try:
                 response = completion(
                     model=self.llm,
                     messages=api_messages,
                     tools=api_tools,
                     tool_choice=tool_choice,
+                    num_retries=0,
                     **self.llm_args,
                 )
                 break
             except Exception as e:
-                if attempt < MAX_RETRIES - 1:
-                    time.sleep(2 ** attempt)
+                if attempt < MAX_RETRIES + 1:
+                    wait = 2 ** attempt
+                    if "rate" in str(e).lower() or "RateLimit" in type(e).__name__:
+                        wait = max(wait, 5)
+                    time.sleep(wait)
                     continue
                 raise
 
